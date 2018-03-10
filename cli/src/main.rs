@@ -21,6 +21,7 @@ use bridge::bridge::{create_bridge, create_deploy, Deployed};
 use bridge::config::Config;
 use bridge::error::{Error, ErrorKind};
 use bridge::web3;
+use bridge::database::Database;
 
 const USAGE: &'static str = r#"
 Ethereum-Kovan bridge.
@@ -81,7 +82,7 @@ fn execute<S, I>(command: I) -> Result<String, Error> where I: IntoIterator<Item
 	info!(target: "bridge", "Deploying contracts (if needed)");
 	let deployed = event_loop.run(create_deploy(app_ref.clone()))?;
 
-	let database = match deployed {
+	let mut database = match deployed {
 		Deployed::New(database) => {
 			info!(target: "bridge", "Deployed new bridge contracts");
 			info!(target: "bridge", "\n\n{}\n", database);
@@ -112,11 +113,13 @@ fn execute<S, I>(command: I) -> Result<String, Error> where I: IntoIterator<Item
 					},
 				};
 				let app_ref = Arc::new(app.as_ref());
+                database = Database::load(&args.arg_database).unwrap();
 				let bridge = create_bridge(app_ref.clone(), &database).and_then(|_| future::ok(true)).collect();
 				event_loop.run(bridge)
 			},
 			&Err(ref e) => {
 				warn!("Bridge is down with {}, attempting to restart", e);
+                database = Database::load(&args.arg_database).unwrap();
 				let bridge = create_bridge(app_ref.clone(), &database).and_then(|_| future::ok(true)).collect();
 				event_loop.run(bridge)
 			},
