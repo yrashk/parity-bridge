@@ -26,6 +26,7 @@ use bridge::web3;
 const ERR_UNKNOWN: i32 = 1;
 const ERR_IO_ERROR: i32 = 2;
 const ERR_SHUTDOWN_REQUESTED: i32 = 3;
+const ERR_INSUFFICIENT_FUNDS: i32 = 4;
 const ERR_CANNOT_CONNECT: i32 = 10;
 const ERR_CONNECTION_LOST: i32 = 11;
 const ERR_BRIDGE_CRASH: i32 = 11;
@@ -159,7 +160,11 @@ fn execute<S, I>(command: I, running: Arc<AtomicBool>) -> Result<String, UserFac
 		    Err(e @ Error(ErrorKind::ShutdownRequested, _)) => {
 				info!("Shutdown requested, terminating");
 				return Err((ERR_SHUTDOWN_REQUESTED, e.into()).into());
-			}
+			},
+  		    Err(e @ Error(ErrorKind::InsufficientFunds, _)) => {
+  			    info!("Insufficient funds, terminating");
+			    return Err((ERR_INSUFFICIENT_FUNDS, e.into()).into());
+		    },
 			Err(e) => {
 				warn!("Bridge crashed with {}", e);
 				return Err((ERR_BRIDGE_CRASH, e).into());
