@@ -9,6 +9,7 @@ use config::Node;
 use transaction::prepare_raw_transaction;
 use app::App;
 use std::sync::Arc;
+use rpc;
 
 /// State of balance checking.
 enum NonceCheckState<T: Transport, S: TransactionSender> {
@@ -81,8 +82,21 @@ impl<T: Transport, S: TransactionSender> Future for NonceCheck<T, S> {
 					}
 				},
 				NonceCheckState::TransactionRequest { ref mut future } => {
-					let value = try_ready!(future.poll());
-					return Ok(Async::Ready(value))
+					match future.poll() {
+						Ok(Async::Ready(t)) => return Ok(Async::Ready(t)),
+						Ok(Async::NotReady) => return Ok(Async::NotReady),
+						Err(e) => match e {
+							Error(ErrorKind::Web3(web3::error::Error(web3::error::ErrorKind::Rpc(rpc_err), _)), _) => {
+								if rpc_err.code == rpc::ErrorCode::ServerError(-32010) && rpc_err.message.ends_with("incrementing the nonce.") {
+									// restart the process
+									NonceCheckState::Ready
+								} else {
+									return Err(ErrorKind::Web3(web3::error::ErrorKind::Rpc(rpc_err).into()).into());
+								}
+							},
+							e => return Err(From::from(e)),
+						},
+					}
 				},
 			};
 			self.state = next_state;
