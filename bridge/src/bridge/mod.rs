@@ -27,7 +27,7 @@ pub use self::withdraw_confirm::{WithdrawConfirm, create_withdraw_confirm};
 #[derive(Clone, Copy)]
 pub enum BridgeChecked {
 	DepositRelay(u64),
-	WithdrawRelay(u64),
+	WithdrawRelay((u64, u32)),
 	WithdrawConfirm(u64),
 }
 
@@ -47,8 +47,9 @@ impl BridgeBackend for FileBackend {
 				BridgeChecked::DepositRelay(n) => {
 					self.database.checked_deposit_relay = n;
 				},
-				BridgeChecked::WithdrawRelay(n) => {
+				BridgeChecked::WithdrawRelay((n, sigs)) => {
 					self.database.checked_withdraw_relay = n;
+					self.database.withdraw_relay_required_signatures = Some(sigs);
 				},
 				BridgeChecked::WithdrawConfirm(n) => {
 					self.database.checked_withdraw_confirm = n;
@@ -168,12 +169,14 @@ impl<T: Transport, F: BridgeBackend> Stream for Bridge<T, F> {
 						self.check_balances()?;
 					}
 
+
 					let w_relay = try_bridge!(self.withdraw_relay.poll().map_err(|e| ErrorKind::ContextualizedError(Box::new(e), "withdraw_relay"))).
 						map(BridgeChecked::WithdrawRelay);
 
 					if w_relay.is_some() {
 						self.check_balances()?;
 					}
+
 
 					let w_confirm = try_bridge!(self.withdraw_confirm.poll().map_err(|e| ErrorKind::ContextualizedError(Box::new(e), "withdraw_confirm"))).
 						map(BridgeChecked::WithdrawConfirm);
@@ -226,10 +229,11 @@ mod tests {
 		assert_eq!(1, backend.database.checked_deposit_relay);
 		assert_eq!(0, backend.database.checked_withdraw_confirm);
 		assert_eq!(0, backend.database.checked_withdraw_relay);
-		backend.save(vec![BridgeChecked::DepositRelay(2), BridgeChecked::WithdrawConfirm(3), BridgeChecked::WithdrawRelay(2)]).unwrap();
+		backend.save(vec![BridgeChecked::DepositRelay(2), BridgeChecked::WithdrawConfirm(3), BridgeChecked::WithdrawRelay((2, 1))]).unwrap();
 		assert_eq!(2, backend.database.checked_deposit_relay);
 		assert_eq!(3, backend.database.checked_withdraw_confirm);
 		assert_eq!(2, backend.database.checked_withdraw_relay);
+		assert_eq!(1, backend.database.withdraw_relay_required_signatures.unwrap());
 
 		let loaded = Database::load(path).unwrap();
 		assert_eq!(backend.database, loaded);
