@@ -194,10 +194,10 @@ library MessageTest {
 /// instances to get information when the bridge contract was deployed.
 /// This will avoid necessity to distribute this information as part of the
 /// database file to new validators if they want to join to existing
-/// bridge validators group. 
+/// bridge validators group.
 /// So, now bridge deployment script or webapp could pickup HomeBridge
 /// and ForeignBridge addresses and request block deployed from the contracts
-/// in order to  generate correct database file. 
+/// in order to  generate correct database file.
 contract BridgeDeploymentAddressStorage {
     uint256 public deployedAtBlock;
 
@@ -246,12 +246,14 @@ contract ForeignBridgeGasConsumptionLimitsStorage {
     }
 }
 
-contract HomeBridge is BridgeDeploymentAddressStorage, 
+contract HomeBridge is BridgeDeploymentAddressStorage,
                        HomeBridgeGasConsumptionLimitsStorage {
     /// Number of authorities signatures required to withdraw the money.
     ///
     /// Must be lesser than number of authorities.
     uint256 public requiredSignatures;
+
+    event RequiredSignaturesChanged (uint256 requiredSignatures);
 
     /// The gas cost of calling `HomeBridge.withdraw`.
     ///
@@ -284,6 +286,7 @@ contract HomeBridge is BridgeDeploymentAddressStorage,
         requiredSignatures = requiredSignaturesParam;
         authorities = authoritiesParam;
         estimatedGasCostOfWithdraw = estimatedGasCostOfWithdrawParam;
+        RequiredSignaturesChanged(requiredSignatures);
     }
 
     /// Should be used to deposit money.
@@ -351,12 +354,13 @@ contract ERC20 {
     function balanceOf(address tokenOwner) public constant returns (uint balance);
 }
 
-contract ForeignBridge is BridgeDeploymentAddressStorage, 
+contract ForeignBridge is BridgeDeploymentAddressStorage,
                           ForeignBridgeGasConsumptionLimitsStorage {
     /// Number of authorities signatures required to withdraw the money.
     ///
     /// Must be less than number of authorities.
     uint256 public requiredSignatures;
+    event RequiredSignaturesChanged (uint256 requiredSignatures);
 
     uint256 public estimatedGasCostOfWithdraw;
 
@@ -415,12 +419,14 @@ contract ForeignBridge is BridgeDeploymentAddressStorage,
         require(_requiredSignatures != 0);
         require(_requiredSignatures <= _authorities.length);
         requiredSignatures = _requiredSignatures;
-        
+
         for (uint i = 0; i < _authorities.length; i++) {
             authorities[_authorities[i]] = true;
         }
-        
+
         estimatedGasCostOfWithdraw = _estimatedGasCostOfWithdraw;
+
+        RequiredSignaturesChanged(requiredSignatures);
     }
 
     /// require that sender is an authority

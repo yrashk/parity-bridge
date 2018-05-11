@@ -1,10 +1,10 @@
 use std::sync::{Arc, RwLock};
-use futures::{self, Future, Stream, stream::{Collect, iter_ok, IterOk, Buffered}, Poll};
+use futures::{self, Async, Future, Stream, stream::{Collect, iter_ok, IterOk, Buffered}, Poll};
 use futures::future::{JoinAll, join_all, Join};
 use tokio_timer::Timeout;
 use web3::Transport;
 use web3::types::{U256, Address, FilterBuilder, Log, Bytes};
-use ethabi::{RawLog, self};
+use ethabi::{RawLog, Topic, self};
 use app::App;
 use api::{self, LogStream, ApiCall};
 use contracts::foreign;
@@ -19,9 +19,25 @@ use itertools::Itertools;
 
 /// returns a filter for `ForeignBridge.CollectedSignatures` events
 fn collected_signatures_filter(foreign: &foreign::ForeignBridge, address: Address) -> FilterBuilder {
-	let filter = foreign.events().collected_signatures().create_filter();
+	let mut filter = foreign.events().collected_signatures().create_filter();
+	let sig_filter = foreign.events().required_signatures_changed().create_filter();
+	// Combine with the `RequiredSignaturesChanged` event
+	match filter.topic0 {
+		Topic::This(t) => filter.topic0 = Topic::OneOf(vec![t]),
+		Topic::OneOf(ref mut vec) => {
+			vec.append(&mut sig_filter.topic0.into());
+		},
+		_ => (),
+	}
 	web3_filter(filter, address)
 }
+
+/// returns a filter for `ForeignBridge.RequiredSignaturesChanged` events
+fn required_signatures_filter(foreign: &foreign::ForeignBridge, address: Address) -> FilterBuilder {
+	let filter = foreign.events().required_signatures_changed().create_filter();
+	web3_filter(filter, address)
+}
+
 
 /// payloads for calls to `ForeignBridge.signature` and `ForeignBridge.message`
 /// to retrieve the signatures (v, r, s) and messages
@@ -33,7 +49,12 @@ struct RelayAssignment {
 	message_payload: Bytes,
 }
 
-fn signatures_payload(foreign: &foreign::ForeignBridge, required_signatures: u32, my_address: Address, log: Log) -> error::Result<Option<RelayAssignment>> {
+fn signatures_payload(foreign: &foreign::ForeignBridge, required_signatures: u32, my_address: Address, log: Log) -> error::Result<(Option<RelayAssignment>, u32)> {
+	// check if this is a RequiredSignaturesChanged event
+	match get_required_signatures(foreign, log.clone()) {
+		Some(signatures) => return Ok((None, signatures)),
+		None => (),
+	}
 	// convert web3::Log to ethabi::RawLog since ethabi events can
 	// only be parsed from the latter
 	let raw_log = RawLog {
@@ -45,7 +66,7 @@ fn signatures_payload(foreign: &foreign::ForeignBridge, required_signatures: u32
 		info!("bridge not responsible for relaying transaction to home. tx hash: {}", log.transaction_hash.unwrap());
 		// this authority is not responsible for relaying this transaction.
 		// someone else will relay this transaction to home.
-		return Ok(None);
+		return Ok((None, required_signatures));
 	}
 	let signature_payloads = (0..required_signatures).into_iter()
 		.map(|index| foreign.functions().signature().input(collected_signatures.message_hash, index))
@@ -53,14 +74,27 @@ fn signatures_payload(foreign: &foreign::ForeignBridge, required_signatures: u32
 		.collect();
 	let message_payload = foreign.functions().message().input(collected_signatures.message_hash).into();
 
-	Ok(Some(RelayAssignment {
+	Ok((Some(RelayAssignment {
 		signature_payloads,
 		message_payload,
-	}))
+	}), required_signatures))
 }
+
+fn get_required_signatures(foreign: &foreign::ForeignBridge, log: Log) -> Option<u32> {
+	// convert web3::Log to ethabi::RawLog since ethabi events can
+	// only be parsed from the latter
+	let raw_log = RawLog {
+		topics: log.topics.into_iter().map(|t| t.0.into()).collect(),
+		data: log.data.0,
+	};
+	foreign.events().required_signatures_changed().parse_log(raw_log)
+		.ok().map(|v| v.required_signatures.low_u32())
+}
+
 
 /// state of the withdraw relay state machine
 pub enum WithdrawRelayState<T: Transport> {
+	CheckRequiredSignatures(LogStream<T>),
 	Wait,
 	FetchMessagesSignatures {
 		future: Join<
@@ -85,11 +119,26 @@ pub fn create_withdraw_relay<T: Transport + Clone>(app: Arc<App<T>>, init: &Data
 		filter: collected_signatures_filter(&app.foreign_bridge, init.foreign_contract_address),
 	};
 
+	let state = if init.withdraw_relay_required_signatures.is_none() {
+		let required_sigs_logs_init = api::LogStreamInit {
+			after: init.foreign_deploy.map(|v| v - 1).unwrap_or(0),
+			request_timeout: app.config.foreign.request_timeout,
+			poll_interval: app.config.foreign.poll_interval,
+			confirmations: app.config.foreign.required_confirmations,
+			filter: required_signatures_filter(&app.foreign_bridge, init.foreign_contract_address),
+		};
+		let log = api::log_stream(app.connections.foreign.clone(), app.timer.clone(), required_sigs_logs_init);
+		WithdrawRelayState::CheckRequiredSignatures(log)
+	} else {
+		WithdrawRelayState::Wait
+	};
+
 	WithdrawRelay {
 		logs: api::log_stream(app.connections.foreign.clone(), app.timer.clone(), logs_init),
 		home_contract: init.home_contract_address,
 		foreign_contract: init.foreign_contract_address,
-		state: WithdrawRelayState::Wait,
+		required_signatures: init.withdraw_relay_required_signatures.clone().unwrap_or(app.config.authorities.accounts.len() as u32),
+		state,
 		app,
 		home_balance,
 		home_chain_id,
@@ -104,10 +153,11 @@ pub struct WithdrawRelay<T: Transport> {
 	home_contract: Address,
 	home_balance: Arc<RwLock<Option<U256>>>,
 	home_chain_id: u64,
+	required_signatures: u32,
 }
 
 impl<T: Transport> Stream for WithdrawRelay<T> {
-	type Item = u64;
+	type Item = (u64, u32);
 	type Error = Error;
 
 	fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
@@ -116,24 +166,59 @@ impl<T: Transport> Stream for WithdrawRelay<T> {
 		let contract = self.home_contract.clone();
 		let home = &self.app.config.home;
 		let t = &self.app.connections.home;
+		let foreign = &self.app.connections.foreign;
 		let chain_id = self.home_chain_id;
+		let foreign_bridge = &self.app.foreign_bridge;
+		let foreign_account = self.app.config.foreign.account;
+		let timer = &self.app.timer;
+		let foreign_contract = self.foreign_contract;
+		let foreign_request_timeout = self.app.config.foreign.request_timeout;
 
 		loop {
+			let required_signatures = self.required_signatures;
 			let next_state = match self.state {
+				WithdrawRelayState::CheckRequiredSignatures(ref mut logs) => {
+					let mut item = try_stream!(logs.poll().map_err(|e| ErrorKind::ContextualizedError(Box::new(e), "checking foreign for last requiredSignatures value")));
+					if item.logs.is_empty() {
+						return Err(ErrorKind::NoRequiredSignaturesChanged.into())
+					}
+					let last_change = item.logs.pop().unwrap();
+					self.required_signatures = get_required_signatures(foreign_bridge, last_change.clone()).unwrap_or(self.required_signatures);
+					info!("Required signatures: {} (block #{})", self.required_signatures, last_change.block_number.unwrap_or(U256::zero()));
+					WithdrawRelayState::Wait
+				},
 				WithdrawRelayState::Wait => {
 					let item = try_stream!(self.logs.poll().map_err(|e| ErrorKind::ContextualizedError(Box::new(e), "polling foreign for collected signatures")));
 					info!("got {} new signed withdraws to relay", item.logs.len());
 					let assignments = item.logs
 						.into_iter()
-						.map(|log| {
+						.fold((self.required_signatures, vec![]), |mut acc, log| {
 							 info!("collected signature is ready for relay: tx hash: {}", log.transaction_hash.unwrap());
-							 signatures_payload(
-								&self.app.foreign_bridge,
-								self.app.config.authorities.required_signatures,
-								self.app.config.foreign.account,
-								log)
-						})
-						.collect::<error::Result<Vec<_>>>()?;
+							 let res = signatures_payload(
+								foreign_bridge,
+								acc.0,
+								foreign_account,
+								log);
+							 match res {
+								 Ok((value, required_signatures)) => {
+									 acc.1.push(Ok(value));
+									 (required_signatures, acc.1)
+								 },
+								 Err(err) => {
+								     acc.1.push(Err(err));
+									 (acc.0, acc.1)
+								 }
+
+							 }
+						});
+
+
+					if assignments.0 != self.required_signatures {
+						self.required_signatures = assignments.0;
+						info!("Required signatures: {} (block #{})", self.required_signatures, item.to);
+					}
+
+					let assignments = assignments.1.into_iter().collect::<error::Result<Vec<_>>>()?;
 
 					let (signatures, messages): (Vec<_>, Vec<_>) = assignments.into_iter()
 						.filter_map(|a| a)
@@ -142,9 +227,9 @@ impl<T: Transport> Stream for WithdrawRelay<T> {
 
 					let message_calls = messages.into_iter()
 						.map(|payload| {
-							self.app.timer.timeout(
-								api::call(&self.app.connections.foreign, self.foreign_contract.clone(), payload),
-								self.app.config.foreign.request_timeout)
+							timer.timeout(
+								api::call(foreign, foreign_contract.clone(), payload),
+								foreign_request_timeout)
 						})
 						.collect::<Vec<_>>();
 
@@ -152,9 +237,9 @@ impl<T: Transport> Stream for WithdrawRelay<T> {
 						.map(|payloads| {
 							payloads.into_iter()
 								.map(|payload| {
-									self.app.timer.timeout(
-										api::call(&self.app.connections.foreign, self.foreign_contract.clone(), payload),
-										self.app.config.foreign.request_timeout)
+									timer.timeout(
+										api::call(foreign, foreign_contract.clone(), payload),
+										foreign_request_timeout)
 								})
 								.collect::<Vec<_>>()
 						})
@@ -246,7 +331,7 @@ impl<T: Transport> Stream for WithdrawRelay<T> {
 						info!("waiting for signed withdraws to relay");
 						WithdrawRelayState::Wait
 					},
-					some => return Ok(some.into()),
+					Some(block) => return Ok(Async::Ready(Some((block, required_signatures)))),
 				}
 			};
 			self.state = next_state;
@@ -282,7 +367,7 @@ mod tests {
 			removed: None,
 		};
 
-		let assignment = signatures_payload(&foreign, 2, my_address, log).unwrap().unwrap();
+		let assignment = signatures_payload(&foreign, 2, my_address, log).unwrap().0.unwrap();
 		let expected_message: Bytes = "490a32c600000000000000000000000000000000000000000000000000000000000000f0".from_hex().unwrap().into();
 		let expected_signatures: Vec<Bytes> = vec![
 			"1812d99600000000000000000000000000000000000000000000000000000000000000f00000000000000000000000000000000000000000000000000000000000000000".from_hex().unwrap().into(),
@@ -314,6 +399,6 @@ mod tests {
 		};
 
 		let assignment = signatures_payload(&foreign, 2, my_address, log).unwrap();
-		assert_eq!(None, assignment);
+		assert_eq!(None, assignment.0);
 	}
 }
