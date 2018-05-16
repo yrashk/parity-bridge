@@ -255,6 +255,8 @@ contract HomeBridge is BridgeDeploymentAddressStorage,
 
     event RequiredSignaturesChanged (uint256 requiredSignatures);
 
+    address public validatorContract;
+
     /// The gas cost of calling `HomeBridge.withdraw`.
     ///
     /// Is subtracted from `value` on withdraw.
@@ -286,6 +288,7 @@ contract HomeBridge is BridgeDeploymentAddressStorage,
         requiredSignatures = requiredSignaturesParam;
         authorities = authoritiesParam;
         estimatedGasCostOfWithdraw = estimatedGasCostOfWithdrawParam;
+        validatorContract = this;
         RequiredSignaturesChanged(requiredSignatures);
     }
 
@@ -364,6 +367,8 @@ contract ForeignBridge is BridgeDeploymentAddressStorage,
 
     uint256 public estimatedGasCostOfWithdraw;
 
+    address public validatorContract;
+
     // Original parity-bridge assumes that anyone could forward final
     // withdraw confirmation to the HomeBridge contract. That's why
     // they need to make sure that no one is trying to steal funds by
@@ -381,7 +386,7 @@ contract ForeignBridge is BridgeDeploymentAddressStorage,
     mapping (bytes32 => bytes) messages;
     /// ???
     mapping (bytes32 => bytes) signatures;
-    
+
     /// Pending deposits and authorities who confirmed them
     mapping (bytes32 => bool) messages_signed;
     mapping (bytes32 => uint) num_messages_signed;
@@ -419,6 +424,7 @@ contract ForeignBridge is BridgeDeploymentAddressStorage,
         require(_requiredSignatures != 0);
         require(_requiredSignatures <= _authorities.length);
         requiredSignatures = _requiredSignatures;
+        validatorContract = this;
 
         for (uint i = 0; i < _authorities.length; i++) {
             authorities[_authorities[i]] = true;

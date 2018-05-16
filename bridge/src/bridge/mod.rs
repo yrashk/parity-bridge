@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use std::path::PathBuf;
 use futures::{Stream, Poll, Async};
 use web3::Transport;
-use web3::types::U256;
+use web3::types::{U256, Address};
 use app::App;
 use database::Database;
 use error::{Error, ErrorKind, Result};
@@ -72,17 +72,18 @@ enum BridgeStatus {
 }
 
 /// Creates new bridge.
-pub fn create_bridge<T: Transport + Clone>(app: Arc<App<T>>, init: &Database, home_chain_id: u64, foreign_chain_id: u64) -> Bridge<T, FileBackend> {
+pub fn create_bridge<T: Transport + Clone>(app: Arc<App<T>>, init: &Database, home_chain_id: u64, foreign_chain_id: u64, foreign_validator_contract: Address) -> Bridge<T, FileBackend> {
 	let backend = FileBackend {
 		path: app.database_path.clone(),
 		database: init.clone(),
 	};
 
-	create_bridge_backed_by(app, init, backend, home_chain_id, foreign_chain_id)
+	create_bridge_backed_by(app, init, backend, home_chain_id, foreign_chain_id, foreign_validator_contract)
 }
 
 /// Creates new bridge writing to custom backend.
-pub fn create_bridge_backed_by<T: Transport + Clone, F: BridgeBackend>(app: Arc<App<T>>, init: &Database, backend: F, home_chain_id: u64, foreign_chain_id: u64) -> Bridge<T, F> {
+pub fn create_bridge_backed_by<T: Transport + Clone, F: BridgeBackend>(app: Arc<App<T>>, init: &Database, backend: F, home_chain_id: u64, foreign_chain_id: u64,
+																	   foreign_validator_contract: Address) -> Bridge<T, F> {
 	let home_balance = Arc::new(RwLock::new(None));
 	let foreign_balance = Arc::new(RwLock::new(None));
 	Bridge {
@@ -91,7 +92,7 @@ pub fn create_bridge_backed_by<T: Transport + Clone, F: BridgeBackend>(app: Arc<
 		foreign_balance: foreign_balance.clone(),
 		home_balance: home_balance.clone(),
 		deposit_relay: create_deposit_relay(app.clone(), init, foreign_balance.clone(), foreign_chain_id),
-		withdraw_relay: create_withdraw_relay(app.clone(), init, home_balance.clone(), home_chain_id),
+		withdraw_relay: create_withdraw_relay(app.clone(), init, home_balance.clone(), home_chain_id, foreign_validator_contract),
 		withdraw_confirm: create_withdraw_confirm(app.clone(), init, foreign_balance.clone(), foreign_chain_id),
 		state: BridgeStatus::Wait,
 		backend,

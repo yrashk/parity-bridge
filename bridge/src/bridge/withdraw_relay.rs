@@ -18,10 +18,10 @@ use super::nonce::{NonceCheck, SendRawTransaction};
 use itertools::Itertools;
 
 /// returns a filter for `ForeignBridge.CollectedSignatures` events
-fn collected_signatures_filter(foreign: &foreign::ForeignBridge, address: Address) -> FilterBuilder {
+fn collected_signatures_filter<I: IntoIterator<Item = Address>>(foreign: &foreign::ForeignBridge, addresses: I) -> FilterBuilder {
 	let mut filter = foreign.events().collected_signatures().create_filter();
 	let sig_filter = foreign.events().required_signatures_changed().create_filter();
-	// Combine with the `RequiredSignaturesChanged` event
+    // Combine with the `RequiredSignaturesChanged` event
 	match filter.topic0 {
 		Topic::This(t) => filter.topic0 = Topic::OneOf(vec![t]),
 		Topic::OneOf(ref mut vec) => {
@@ -29,15 +29,8 @@ fn collected_signatures_filter(foreign: &foreign::ForeignBridge, address: Addres
 		},
 		_ => (),
 	}
-	web3_filter(filter, address)
+	web3_filter(filter, addresses)
 }
-
-/// returns a filter for `ForeignBridge.RequiredSignaturesChanged` events
-fn required_signatures_filter(foreign: &foreign::ForeignBridge, address: Address) -> FilterBuilder {
-	let filter = foreign.events().required_signatures_changed().create_filter();
-	web3_filter(filter, address)
-}
-
 
 /// payloads for calls to `ForeignBridge.signature` and `ForeignBridge.message`
 /// to retrieve the signatures (v, r, s) and messages
@@ -94,7 +87,7 @@ fn get_required_signatures(foreign: &foreign::ForeignBridge, log: Log) -> Option
 
 /// state of the withdraw relay state machine
 pub enum WithdrawRelayState<T: Transport> {
-	CheckRequiredSignatures(LogStream<T>),
+	CheckRequiredSignatures(Timeout<ApiCall<Bytes, T::Out>>),
 	Wait,
 	FetchMessagesSignatures {
 		future: Join<
@@ -110,25 +103,21 @@ pub enum WithdrawRelayState<T: Transport> {
 	Yield(Option<u64>),
 }
 
-pub fn create_withdraw_relay<T: Transport + Clone>(app: Arc<App<T>>, init: &Database, home_balance: Arc<RwLock<Option<U256>>>, home_chain_id: u64) -> WithdrawRelay<T> {
+pub fn create_withdraw_relay<T: Transport + Clone>(app: Arc<App<T>>, init: &Database, home_balance: Arc<RwLock<Option<U256>>>, home_chain_id: u64,
+												   foreign_validator_contract: Address) -> WithdrawRelay<T> {
 	let logs_init = api::LogStreamInit {
 		after: init.checked_withdraw_relay,
 		request_timeout: app.config.foreign.request_timeout,
 		poll_interval: app.config.foreign.poll_interval,
 		confirmations: app.config.foreign.required_confirmations,
-		filter: collected_signatures_filter(&app.foreign_bridge, init.foreign_contract_address),
+		filter: collected_signatures_filter(&app.foreign_bridge, vec![init.foreign_contract_address, foreign_validator_contract]),
 	};
 
 	let state = if init.withdraw_relay_required_signatures.is_none() {
-		let required_sigs_logs_init = api::LogStreamInit {
-			after: init.foreign_deploy.map(|v| v - 1).unwrap_or(0),
-			request_timeout: app.config.foreign.request_timeout,
-			poll_interval: app.config.foreign.poll_interval,
-			confirmations: app.config.foreign.required_confirmations,
-			filter: required_signatures_filter(&app.foreign_bridge, init.foreign_contract_address),
-		};
-		let log = api::log_stream(app.connections.foreign.clone(), app.timer.clone(), required_sigs_logs_init);
-		WithdrawRelayState::CheckRequiredSignatures(log)
+		let call = app.timer.timeout(api::call_at(app.connections.foreign.clone(), foreign_validator_contract,
+												  app.foreign_bridge.functions().required_signatures().input().into(),
+												  Some(init.checked_withdraw_relay.into())), app.config.foreign.request_timeout);
+		WithdrawRelayState::CheckRequiredSignatures(call)
 	} else {
 		WithdrawRelayState::Wait
 	};
@@ -178,13 +167,9 @@ impl<T: Transport> Stream for WithdrawRelay<T> {
 			let required_signatures = self.required_signatures;
 			let next_state = match self.state {
 				WithdrawRelayState::CheckRequiredSignatures(ref mut logs) => {
-					let mut item = try_stream!(logs.poll().map_err(|e| ErrorKind::ContextualizedError(Box::new(e), "checking foreign for last requiredSignatures value")));
-					if item.logs.is_empty() {
-						return Err(ErrorKind::NoRequiredSignaturesChanged.into())
-					}
-					let last_change = item.logs.pop().unwrap();
-					self.required_signatures = get_required_signatures(foreign_bridge, last_change.clone()).unwrap_or(self.required_signatures);
-					info!("Required signatures: {} (block #{})", self.required_signatures, last_change.block_number.unwrap_or(U256::zero()));
+					let mut required_signatures = try_ready!(logs.poll().map_err(|e| ErrorKind::ContextualizedError(Box::new(e), "checking foreign for requiredSignatures value")));
+					self.required_signatures = U256::from(required_signatures.0.as_slice()).low_u32();
+					info!("Required signatures: {}", self.required_signatures);
 					WithdrawRelayState::Wait
 				},
 				WithdrawRelayState::Wait => {
@@ -198,7 +183,7 @@ impl<T: Transport> Stream for WithdrawRelay<T> {
 								foreign_bridge,
 								acc.0,
 								foreign_account,
-								log);
+								 log);
 							 match res {
 								 Ok((value, required_signatures)) => {
 									 acc.1.push(Ok(value));
@@ -207,8 +192,7 @@ impl<T: Transport> Stream for WithdrawRelay<T> {
 								 Err(err) => {
 								     acc.1.push(Err(err));
 									 (acc.0, acc.1)
-								 }
-
+								 },
 							 }
 						});
 
